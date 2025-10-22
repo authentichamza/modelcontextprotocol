@@ -1,12 +1,7 @@
 #!/usr/bin/env node
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { Tool } from "@modelcontextprotocol/sdk/types.js";
 
 /**
  * Definition of the Perplexity Ask Tool.
@@ -153,6 +148,13 @@ const PERPLEXITY_SEARCH_TOOL: Tool = {
     required: ["query"],
   },
 };
+
+const AVAILABLE_TOOLS: Tool[] = [
+  PERPLEXITY_ASK_TOOL,
+  PERPLEXITY_RESEARCH_TOOL,
+  PERPLEXITY_REASON_TOOL,
+  PERPLEXITY_SEARCH_TOOL,
+];
 
 // Retrieve the Perplexity API key from environment variables
 const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
@@ -347,135 +349,285 @@ async function performSearch(
   return formatSearchResults(data);
 }
 
-// Initialize the server with tool metadata and capabilities
-const server = new Server(
-  {
-    name: "example-servers/perplexity-ask",
-    version: "0.1.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
+const MAX_REQUEST_SIZE_BYTES = 512 * 1024;
+const DEFAULT_HEADERS: Record<string, string> = {
+  "Content-Type": "application/json; charset=utf-8",
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
 
-/**
- * Registers a handler for listing available tools.
- * When the client requests a list of tools, this handler returns all available Perplexity tools.
- */
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [PERPLEXITY_ASK_TOOL, PERPLEXITY_RESEARCH_TOOL, PERPLEXITY_REASON_TOOL, PERPLEXITY_SEARCH_TOOL],
-}));
-
-/**
- * Registers a handler for calling a specific tool.
- * Processes requests by validating input and invoking the appropriate tool.
- *
- * @param {object} request - The incoming tool call request.
- * @returns {Promise<object>} The response containing the tool's result or an error.
- */
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  try {
-    const { name, arguments: args } = request.params;
-    if (!args) {
-      throw new Error("No arguments provided");
-    }
-    switch (name) {
-      case "perplexity_ask": {
-        if (!Array.isArray(args.messages)) {
-          throw new Error("Invalid arguments for perplexity_ask: 'messages' must be an array");
-        }
-        // Invoke the chat completion function with the provided messages
-        const messages = args.messages;
-        const result = await performChatCompletion(messages, "sonar-pro");
-        return {
-          content: [{ type: "text", text: result }],
-          isError: false,
-        };
-      }
-      case "perplexity_research": {
-        if (!Array.isArray(args.messages)) {
-          throw new Error("Invalid arguments for perplexity_research: 'messages' must be an array");
-        }
-        // Invoke the chat completion function with the provided messages using the deep research model
-        const messages = args.messages;
-        const result = await performChatCompletion(messages, "sonar-deep-research");
-        return {
-          content: [{ type: "text", text: result }],
-          isError: false,
-        };
-      }
-      case "perplexity_reason": {
-        if (!Array.isArray(args.messages)) {
-          throw new Error("Invalid arguments for perplexity_reason: 'messages' must be an array");
-        }
-        // Invoke the chat completion function with the provided messages using the reasoning model
-        const messages = args.messages;
-        const result = await performChatCompletion(messages, "sonar-reasoning-pro");
-        return {
-          content: [{ type: "text", text: result }],
-          isError: false,
-        };
-      }
-      case "perplexity_search": {
-        if (typeof args.query !== "string") {
-          throw new Error("Invalid arguments for perplexity_search: 'query' must be a string");
-        }
-        const { query, max_results, max_tokens_per_page, country } = args;
-        const maxResults = typeof max_results === "number" ? max_results : undefined;
-        const maxTokensPerPage = typeof max_tokens_per_page === "number" ? max_tokens_per_page : undefined;
-        const countryCode = typeof country === "string" ? country : undefined;
-        
-        const result = await performSearch(
-          query,
-          maxResults,
-          maxTokensPerPage,
-          countryCode
-        );
-        return {
-          content: [{ type: "text", text: result }],
-          isError: false,
-        };
-      }
-      default:
-        // Respond with an error if an unknown tool is requested
-        return {
-          content: [{ type: "text", text: `Unknown tool: ${name}` }],
-          isError: true,
-        };
-    }
-  } catch (error) {
-    // Return error details in the response
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-        },
-      ],
-      isError: true,
-    };
-  }
-});
-
-/**
- * Initializes and runs the server using standard I/O for communication.
- * Logs an error and exits if the server fails to start.
- */
-async function runServer() {
-  try {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("Perplexity MCP Server running on stdio with Ask, Research, Reason, and Search tools");
-  } catch (error) {
-    console.error("Fatal error running server:", error);
-    process.exit(1);
+class HttpError extends Error {
+  constructor(public statusCode: number, message: string) {
+    super(message);
+    this.name = "HttpError";
   }
 }
 
-// Start the server and catch any startup errors
-runServer().catch((error) => {
-  console.error("Fatal error running server:", error);
+type ToolCallArguments = Record<string, unknown>;
+type ToolCallRequest = {
+  name?: string;
+  arguments?: ToolCallArguments;
+};
+
+function getRequestPath(req: IncomingMessage): string {
+  const requestUrl = req.url ?? "/";
+  try {
+    return new URL(requestUrl, "http://localhost").pathname;
+  } catch {
+    return "/";
+  }
+}
+
+function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+  const body = JSON.stringify(payload);
+  res.writeHead(statusCode, {
+    ...DEFAULT_HEADERS,
+    "Content-Length": Buffer.byteLength(body, "utf8").toString(),
+  });
+  res.end(body);
+}
+
+function sendNoContent(res: ServerResponse): void {
+  res.writeHead(204, {
+    ...DEFAULT_HEADERS,
+    "Content-Length": "0",
+  });
+  res.end();
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<ToolCallRequest> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    let aborted = false;
+
+    req.setEncoding("utf8");
+
+    req.on("data", (chunk: string) => {
+      if (aborted) {
+        return;
+      }
+      raw += chunk;
+      if (Buffer.byteLength(raw, "utf8") > MAX_REQUEST_SIZE_BYTES) {
+        aborted = true;
+        req.destroy();
+        reject(new HttpError(413, "Request body too large"));
+      }
+    });
+
+    req.on("end", () => {
+      if (aborted) {
+        return;
+      }
+      if (raw.trim().length === 0) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(new HttpError(400, "Request body must be valid JSON"));
+      }
+    });
+
+    req.on("error", (error) => {
+      if (aborted) {
+        return;
+      }
+      aborted = true;
+      reject(
+        new HttpError(
+          400,
+          `Failed to read request body: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      );
+    });
+  });
+}
+
+async function invokeTool(name: string, args: ToolCallArguments): Promise<string> {
+  const trimmedName = name.trim();
+
+  switch (trimmedName) {
+    case "perplexity_ask": {
+      const messages = args["messages"];
+      if (!Array.isArray(messages)) {
+        throw new Error("Invalid arguments for perplexity_ask: 'messages' must be an array");
+      }
+      return performChatCompletion(
+        messages as Array<{ role: string; content: string }>,
+        "sonar-pro"
+      );
+    }
+    case "perplexity_research": {
+      const messages = args["messages"];
+      if (!Array.isArray(messages)) {
+        throw new Error("Invalid arguments for perplexity_research: 'messages' must be an array");
+      }
+      return performChatCompletion(
+        messages as Array<{ role: string; content: string }>,
+        "sonar-deep-research"
+      );
+    }
+    case "perplexity_reason": {
+      const messages = args["messages"];
+      if (!Array.isArray(messages)) {
+        throw new Error("Invalid arguments for perplexity_reason: 'messages' must be an array");
+      }
+      return performChatCompletion(
+        messages as Array<{ role: string; content: string }>,
+        "sonar-reasoning-pro"
+      );
+    }
+    case "perplexity_search": {
+      const query = args["query"];
+      if (typeof query !== "string" || query.trim().length === 0) {
+        throw new Error("Invalid arguments for perplexity_search: 'query' must be a non-empty string");
+      }
+
+      const maxResultsRaw = args["max_results"];
+      const maxTokensRaw = args["max_tokens_per_page"];
+      const countryRaw = args["country"];
+
+      const maxResults = typeof maxResultsRaw === "number" ? maxResultsRaw : 10;
+      const maxTokensPerPage = typeof maxTokensRaw === "number" ? maxTokensRaw : 1024;
+      const countryCode = typeof countryRaw === "string" ? countryRaw : undefined;
+
+      if (maxResults < 1 || maxResults > 20) {
+        throw new Error("Invalid arguments for perplexity_search: 'max_results' must be between 1 and 20");
+      }
+      if (maxTokensPerPage < 256 || maxTokensPerPage > 2048) {
+        throw new Error(
+          "Invalid arguments for perplexity_search: 'max_tokens_per_page' must be between 256 and 2048"
+        );
+      }
+
+      return performSearch(query, maxResults, maxTokensPerPage, countryCode);
+    }
+    default:
+      throw new Error(`Unknown tool: ${trimmedName}`);
+  }
+}
+
+const serverStartTime = new Date().toISOString();
+const rawPort = process.env.PORT ?? "3000";
+const PORT = Number.parseInt(rawPort, 10);
+
+if (!Number.isFinite(PORT)) {
+  console.error(`Invalid PORT environment variable: ${rawPort}`);
   process.exit(1);
+}
+
+const HOST = "0.0.0.0";
+
+const server = createServer((req, res) => {
+  (async () => {
+    const method = (req.method ?? "GET").toUpperCase();
+    const path = getRequestPath(req);
+
+    if (method === "OPTIONS") {
+      sendNoContent(res);
+      return;
+    }
+
+    if (method === "GET" && path === "/") {
+      sendJson(res, 200, {
+        service: "perplexity-mcp",
+        mode: "http",
+        tools: AVAILABLE_TOOLS.map((tool) => tool.name),
+      });
+      return;
+    }
+
+    if (method === "GET" && path === "/health") {
+      sendJson(res, 200, {
+        status: "ok",
+        uptimeSeconds: process.uptime(),
+        startTime: serverStartTime,
+      });
+      return;
+    }
+
+    if (method === "GET" && path === "/tools") {
+      sendJson(res, 200, { tools: AVAILABLE_TOOLS });
+      return;
+    }
+
+    if (method === "POST" && path === "/tools/call") {
+      const contentType = (req.headers["content-type"] ?? "").toString().toLowerCase();
+      if (!contentType.includes("application/json")) {
+        sendJson(res, 415, { error: "Content-Type must be application/json" });
+        return;
+      }
+
+      let body: ToolCallRequest;
+      try {
+        body = await readJsonBody(req);
+      } catch (error) {
+        const err = error as HttpError;
+        const statusCode = err.statusCode ?? 500;
+        sendJson(res, statusCode, { error: err.message });
+        return;
+      }
+
+      if (typeof body.name !== "string" || body.name.trim().length === 0) {
+        sendJson(res, 400, { error: "Request body must include a non-empty 'name' field" });
+        return;
+      }
+
+      const args = (body.arguments ?? {}) as ToolCallArguments;
+
+      try {
+        const result = await invokeTool(body.name, args);
+        sendJson(res, 200, {
+          content: [{ type: "text", text: result }],
+          isError: false,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Tool invocation failed for ${body.name}:`, message);
+        sendJson(res, 400, {
+          content: [{ type: "text", text: `Error: ${message}` }],
+          isError: true,
+        });
+      }
+      return;
+    }
+
+    sendJson(res, 404, { error: "Not found" });
+  })().catch((error) => {
+    console.error("Unhandled error while processing request:", error);
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: "Internal server error" });
+    } else {
+      res.destroy();
+    }
+  });
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`Perplexity MCP HTTP server listening on port ${PORT}`);
+});
+
+server.on("error", (error) => {
+  console.error("Fatal server error:", error);
+  process.exit(1);
+});
+
+const handleShutdown = (signal: NodeJS.Signals) => {
+  console.log(`Received ${signal}, shutting down`);
+  server.close(() => process.exit(0));
+};
+
+process.on("SIGINT", handleShutdown);
+process.on("SIGTERM", handleShutdown);
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
 });

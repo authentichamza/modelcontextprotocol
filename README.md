@@ -1,15 +1,15 @@
 # Perplexity API Platform MCP Server
 
-The official MCP server implementation for the Perplexity API Platform, providing AI assistants with real-time web search, reasoning, and research capabilities through Sonar models and the Search API.
+The official MCP server implementation for the Perplexity API Platform, providing AI assistants with real-time web search, reasoning, and research capabilities through Sonar models and the Search API. The service now exposes an HTTP interface so it can run remotely (for example on Heroku) instead of relying on stdio transports.
 
-Please refer to the official [DeepWiki page](https://deepwiki.com/ppl-ai/modelcontextprotocol) for assistance with implementation.
+Please refer to the official [DeepWiki page](https://deepwiki.com/ppl-ai/modelcontextprotocol) for assistance with Model Context Protocol concepts.
 
 ## Available Tools
 
 ### **perplexity_search**
 Direct web search using the Perplexity Search API. Returns ranked search results with metadata, perfect for finding current information.
 
-### **perplexity_ask** 
+### **perplexity_ask**
 General-purpose conversational AI with real-time web search using the `sonar-pro` model. Great for quick questions and everyday searches.
 
 ### **perplexity_research**
@@ -20,100 +20,65 @@ Advanced reasoning and problem-solving using the `sonar-reasoning-pro` model. Pe
 
 ## Configuration
 
-### Get Your API Key
-1. Get your Perplexity API Key from the [API Portal](https://www.perplexity.ai/account/api/group)
-2. Set it as an environment variable: `PERPLEXITY_API_KEY=your_key_here`
-3. (Optional) Set a timeout for requests: `PERPLEXITY_TIMEOUT_MS=600000`. The default is 5 minutes.
+### Required Environment Variables
+- `PERPLEXITY_API_KEY`: Your Perplexity API key (obtain it from the [API Portal](https://www.perplexity.ai/account/api/group)).
+- `PORT`: (Optional) Port for the HTTP server. Defaults to `3000` locally; Heroku injects this automatically.
+- `PERPLEXITY_TIMEOUT_MS`: (Optional) Timeout for upstream requests in milliseconds. Defaults to `300000` (5 minutes).
 
-### Claude Code
-
-Run in your terminal:
+## Running Locally
 
 ```bash
-claude mcp add perplexity --transport stdio --env PERPLEXITY_API_KEY=your_key_here -- npx -y perplexity-mcp
+npm install
+npm run build
+npm start
 ```
 
-Or add to your `claude.json`:
-
-```json
-"mcpServers": {
-  "perplexity": {
-    "type": "stdio",
-    "command": "npx",
-    "args": [
-      "-y",
-      "perplexity-mcp"
-    ],
-    "env": {
-      "PERPLEXITY_API_KEY": "your_key_here",
-      "PERPLEXITY_TIMEOUT_MS": "600000"
-    }
-  }
-}
-```
-
-### Cursor
-
-Add to your `mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "perplexity": {
-      "command": "npx",
-      "args": ["-y", "@perplexity-ai/mcp-server"],
-      "env": {
-        "PERPLEXITY_API_KEY": "your_key_here",
-        "PERPLEXITY_TIMEOUT_MS": "600000"
-      }
-    }
-  }
-}
-```
-
-### Codex
-
-Run in your terminal:
+Once started, the server listens on `http://localhost:3000` (or the value of `PORT`). You can interact with it using standard HTTP requests:
 
 ```bash
-codex mcp add perplexity --env PERPLEXITY_API_KEY=your_key_here -- npx -y @perplexity-ai/mcp-server
+# Retrieve tool metadata
+curl http://localhost:3000/tools
+
+# Invoke a tool
+curl \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "perplexity_search",
+        "arguments": {"query": "latest space news", "max_results": 3}
+      }' \
+  http://localhost:3000/tools/call
 ```
 
-### Claude Desktop
+### API Endpoints
+- `GET /` – Basic service info and available tool names.
+- `GET /health` – Health report with uptime.
+- `GET /tools` – Full tool definitions and JSON schemas.
+- `POST /tools/call` – Invoke a tool with a JSON body containing `name` and `arguments`.
 
-Add to your `claude_desktop_config.json`:
+## Deploying to Heroku
 
-```json
-{
-  "mcpServers": {
-    "perplexity": {
-      "command": "npx",
-      "args": ["-y", "@perplexity-ai/mcp-server"],
-      "env": {
-        "PERPLEXITY_API_KEY": "your_key_here",
-        "PERPLEXITY_TIMEOUT_MS": "600000"
-      }
-    }
-  }
-}
-```
-
-### Other MCP Clients
-
-For any MCP-compatible client, use:
-
-```bash
-npx @perplexity-ai/mcp-server
-```
+1. Create a Heroku app:
+   ```bash
+   heroku create your-perplexity-server
+   ```
+2. Set required configuration:
+   ```bash
+   heroku config:set PERPLEXITY_API_KEY=your_key_here PERPLEXITY_TIMEOUT_MS=600000
+   ```
+3. Deploy:
+   ```bash
+   git push heroku main
+   ```
+4. Test the deployment (replace `your-app` with your Heroku app name):
+   ```bash
+   curl https://your-app.herokuapp.com/health
+   ```
 
 ## Troubleshooting
 
-- **API Key Issues**: Ensure `PERPLEXITY_API_KEY` is set correctly
-- **Connection Errors**: Check your internet connection and API key validity
-- **Tool Not Found**: Make sure the package is installed and the command path is correct
-- **Timeout Errors**: For very long research queries, set `PERPLEXITY_TIMEOUT_MS` to a higher value
+- **API Key Issues**: Ensure `PERPLEXITY_API_KEY` is configured for the runtime environment.
+- **Connection Errors**: Check outbound connectivity and confirm the Perplexity API is reachable.
+- **Invalid Requests**: Verify that tool invocations use the documented JSON schema.
+- **Timeout Errors**: For long-running queries, increase `PERPLEXITY_TIMEOUT_MS`.
 
 For support, visit [community.perplexity.ai](https://community.perplexity.ai) or [file an issue](https://github.com/perplexityai/modelcontextprotocol/issues).
-
----
-
