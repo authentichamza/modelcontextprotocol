@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
-import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from "node:crypto";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
 
 /**
  * Definition of the Perplexity Ask Tool.
@@ -353,8 +360,8 @@ const MAX_REQUEST_SIZE_BYTES = 512 * 1024;
 const DEFAULT_HEADERS: Record<string, string> = {
   "Content-Type": "application/json; charset=utf-8",
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type,Accept,Mcp-Session-Id,Authorization",
 };
 
 class HttpError extends Error {
@@ -511,6 +518,195 @@ async function invokeTool(name: string, args: ToolCallArguments): Promise<string
   }
 }
 
+const MCP_STREAM_PATH = "/mcp/stream";
+
+interface SessionContext {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+  sessionId?: string;
+}
+
+const sessions = new Map<string, SessionContext>();
+
+function createMcpServerInstance(): Server {
+  const server = new Server(
+    {
+      name: "example-servers/perplexity-ask",
+      version: "0.1.0",
+    },
+    {
+      capabilities: {
+        tools: {},
+      },
+    }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: AVAILABLE_TOOLS,
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    try {
+      const { name, arguments: args } = request.params;
+      if (typeof name !== "string") {
+        throw new Error("Tool name must be a string");
+      }
+      if (!args) {
+        throw new Error("No arguments provided");
+      }
+
+      const result = await invokeTool(name, args as ToolCallArguments);
+      return {
+        content: [{ type: "text", text: result }],
+        isError: false,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("Tool invocation error:", message);
+      return {
+        content: [{ type: "text", text: `Error: ${message}` }],
+        isError: true,
+      };
+    }
+  });
+
+  server.onerror = (error) => {
+    console.error("MCP server error:", error);
+  };
+
+  return server;
+}
+
+async function createSessionContext(): Promise<SessionContext> {
+  const server = createMcpServerInstance();
+  const context: SessionContext = {
+    server,
+    transport: undefined as unknown as StreamableHTTPServerTransport,
+    sessionId: undefined,
+  };
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: async (sessionId) => {
+      context.sessionId = sessionId;
+      sessions.set(sessionId, context);
+    },
+    onsessionclosed: async (sessionId) => {
+      sessions.delete(sessionId);
+    },
+  });
+
+  context.transport = transport;
+
+  transport.onclose = () => {
+    if (context.sessionId) {
+      sessions.delete(context.sessionId);
+    }
+  };
+
+  transport.onerror = (error) => {
+    console.error("Streamable HTTP transport error:", error);
+  };
+
+  server.onclose = () => {
+    if (context.sessionId) {
+      sessions.delete(context.sessionId);
+    }
+  };
+
+  await server.connect(transport);
+
+  return context;
+}
+
+function getSessionIdFromRequest(req: IncomingMessage): string | undefined {
+  const header = req.headers["mcp-session-id"];
+  if (Array.isArray(header)) {
+    return header[0];
+  }
+  if (typeof header === "string" && header.trim().length > 0) {
+    return header.trim();
+  }
+  return undefined;
+}
+
+function isMcpRequest(path: string, req: IncomingMessage): boolean {
+  const normalizedPath = path.endsWith("/") && path !== "/" ? path.slice(0, -1) : path;
+  if (normalizedPath === MCP_STREAM_PATH || normalizedPath === "/mcp") {
+    return true;
+  }
+  if (req.headers["mcp-session-id"]) {
+    return true;
+  }
+  const accept = (req.headers["accept"] ?? "").toString().toLowerCase();
+  return accept.includes("text/event-stream");
+}
+
+async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const method = (req.method ?? "").toUpperCase();
+  if (!["GET", "POST", "DELETE"].includes(method)) {
+    sendJson(res, 405, {
+      jsonrpc: "2.0",
+      error: {
+        code: -32600,
+        message: `Method ${method || "UNKNOWN"} not allowed for MCP transport`,
+      },
+      id: null,
+    });
+    return;
+  }
+
+  let sessionId = getSessionIdFromRequest(req);
+  let context = sessionId ? sessions.get(sessionId) : undefined;
+
+  if (!context) {
+    if (method !== "POST") {
+      sendJson(res, 404, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32004,
+          message: "Unknown MCP session",
+        },
+        id: null,
+      });
+      return;
+    }
+
+    try {
+      context = await createSessionContext();
+    } catch (error) {
+      console.error("Failed to initialize MCP session:", error);
+      sendJson(res, 500, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32603,
+          message: "Internal error while initializing MCP session",
+        },
+        id: null,
+      });
+      return;
+    }
+  }
+
+  try {
+    await context.transport.handleRequest(req as IncomingMessage & { auth?: unknown }, res);
+  } catch (error) {
+    console.error("Unhandled MCP transport error:", error);
+    if (!res.headersSent) {
+      sendJson(res, 500, {
+        jsonrpc: "2.0",
+        error: {
+          code: -32603,
+          message: "Internal server error while processing MCP request",
+        },
+        id: null,
+      });
+    } else {
+      res.destroy();
+    }
+  }
+}
+
 const serverStartTime = new Date().toISOString();
 const rawPort = process.env.PORT ?? "3000";
 const PORT = Number.parseInt(rawPort, 10);
@@ -522,7 +718,7 @@ if (!Number.isFinite(PORT)) {
 
 const HOST = "0.0.0.0";
 
-const server = createServer((req, res) => {
+const httpServer = createServer((req, res) => {
   (async () => {
     const method = (req.method ?? "GET").toUpperCase();
     const path = getRequestPath(req);
@@ -532,11 +728,17 @@ const server = createServer((req, res) => {
       return;
     }
 
+    if (isMcpRequest(path, req)) {
+      await handleMcpHttpRequest(req, res);
+      return;
+    }
+
     if (method === "GET" && path === "/") {
       sendJson(res, 200, {
         service: "perplexity-mcp",
         mode: "http",
         tools: AVAILABLE_TOOLS.map((tool) => tool.name),
+        mcpEndpoint: MCP_STREAM_PATH,
       });
       return;
     }
@@ -607,18 +809,18 @@ const server = createServer((req, res) => {
   });
 });
 
-server.listen(PORT, HOST, () => {
+httpServer.listen(PORT, HOST, () => {
   console.log(`Perplexity MCP HTTP server listening on port ${PORT}`);
 });
 
-server.on("error", (error) => {
+httpServer.on("error", (error) => {
   console.error("Fatal server error:", error);
   process.exit(1);
 });
 
 const handleShutdown = (signal: NodeJS.Signals) => {
   console.log(`Received ${signal}, shutting down`);
-  server.close(() => process.exit(0));
+  httpServer.close(() => process.exit(0));
 };
 
 process.on("SIGINT", handleShutdown);
