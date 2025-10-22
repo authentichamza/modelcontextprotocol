@@ -518,7 +518,7 @@ async function invokeTool(name: string, args: ToolCallArguments): Promise<string
   }
 }
 
-const MCP_STREAM_PATH = "/mcp/stream";
+const MCP_BASE_PATH = "/mcp";
 
 interface SessionContext {
   server: Server;
@@ -631,8 +631,9 @@ function getSessionIdFromRequest(req: IncomingMessage): string | undefined {
 }
 
 function isMcpRequest(path: string, req: IncomingMessage): boolean {
-  const normalizedPath = path.endsWith("/") && path !== "/" ? path.slice(0, -1) : path;
-  if (normalizedPath === MCP_STREAM_PATH || normalizedPath === "/mcp") {
+  const normalizedPath =
+    path.endsWith("/") && path !== "/" ? path.slice(0, -1) : path;
+  if (normalizedPath === MCP_BASE_PATH || normalizedPath.startsWith(`${MCP_BASE_PATH}/`)) {
     return true;
   }
   if (req.headers["mcp-session-id"]) {
@@ -738,7 +739,7 @@ const httpServer = createServer((req, res) => {
         service: "perplexity-mcp",
         mode: "http",
         tools: AVAILABLE_TOOLS.map((tool) => tool.name),
-        mcpEndpoint: MCP_STREAM_PATH,
+        mcpEndpoint: MCP_BASE_PATH,
       });
       return;
     }
