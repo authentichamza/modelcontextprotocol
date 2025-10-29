@@ -54,10 +54,10 @@ curl \
 - `GET /health` – Health report with uptime.
 - `GET /tools` – Full tool definitions and JSON schemas.
 - `POST /tools/call` – Invoke a tool with a JSON body containing `name` and `arguments`.
-- `POST|GET|DELETE /mcp/stream` – Streamable HTTP transport for MCP clients. POST requests must advertise `Accept: application/json, text/event-stream` and initialize the session before opening an SSE stream with `GET /mcp/stream`.
+- `POST|GET|DELETE /mcp` – Streamable HTTP transport for MCP clients. POST requests must advertise `Accept: application/json, text/event-stream` and initialize the session before opening an SSE stream with `GET /mcp`.
 
 ### MCP Streamable HTTP Clients
-- Connect using the MCP Streamable HTTP transport at `http(s)://<host>/mcp/stream`.
+- Connect using the MCP Streamable HTTP transport at `http(s)://<host>/mcp`.
 - A minimal Python example with the official `mcp` package:
 
   ```python
@@ -66,7 +66,7 @@ curl \
   from mcp.client.streamable_http import streamablehttp_client
 
   async def main():
-      async with streamablehttp_client("https://your-app.herokuapp.com/mcp/stream") as (read_stream, write_stream, _):
+      async with streamablehttp_client("https://your-app.herokuapp.com/mcp") as (read_stream, write_stream, _):
           async with ClientSession(read_stream, write_stream) as session:
               await session.initialize()
               tools = await session.list_tools()

@@ -490,6 +490,7 @@ async function invokeTool(name: string, args: ToolCallArguments): Promise<string
     }
     case "perplexity_search": {
       const query = args["query"];
+      console.log(query);
       if (typeof query !== "string" || query.trim().length === 0) {
         throw new Error("Invalid arguments for perplexity_search: 'query' must be a non-empty string");
       }
@@ -690,6 +691,7 @@ async function handleMcpHttpRequest(req: IncomingMessage, res: ServerResponse): 
   }
 
   try {
+    // @ts-ignore
     await context.transport.handleRequest(req as IncomingMessage & { auth?: unknown }, res);
   } catch (error) {
     console.error("Unhandled MCP transport error:", error);
@@ -754,6 +756,8 @@ const httpServer = createServer((req, res) => {
     }
 
     if (method === "GET" && path === "/tools") {
+      console.log("tools");
+      console.log(AVAILABLE_TOOLS);
       sendJson(res, 200, { tools: AVAILABLE_TOOLS });
       return;
     }
